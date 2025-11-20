@@ -64,11 +64,12 @@ class CheckmarxClient:
         """Authenticate and obtain access token."""
         auth_url = f"{self.base_url}/cxrestapi/auth/identity/connect/token"
         
+        # Try with access_control_api scope first (for user management APIs)
         data = {
             'username': self.username,
             'password': self.password,
             'grant_type': 'password',
-            'scope': 'sast_rest_api',
+            'scope': 'access_control_api',
             'client_id': 'resource_owner_client',
             'client_secret': '014DF517-39D1-4453-B7B3-9930C563627C'
         }
@@ -113,6 +114,32 @@ class CheckmarxClient:
             logger.error(f"Failed to get users: {e}")
             raise
     
+    def get_projects(self) -> List[Dict]:
+        """Get all projects from Checkmarx."""
+        url = f"{self.base_url}/cxrestapi/projects"
+        
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            projects = response.json()
+            logger.info(f"Retrieved {len(projects)} projects from Checkmarx")
+            return projects
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get projects: {e}")
+            return []
+    
+    def get_project_details(self, project_id: int) -> Dict:
+        """Get detailed information for a specific project."""
+        url = f"{self.base_url}/cxrestapi/projects/{project_id}"
+        
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Failed to get project details for {project_id}: {e}")
+            return {}
+    
     def get_user_teams(self, user_id: int) -> List[Dict]:
         """Get teams for a specific user."""
         url = f"{self.base_url}/cxrestapi/auth/users/{user_id}/teams"
@@ -144,17 +171,39 @@ class CheckmarxClient:
             logger.error(f"Failed to get users for team {team_id} ({team_name}): {e}")
             return []
     
-    def get_team_memberships(self, use_alternative_method: bool = False) -> Dict[str, Set[str]]:
+    def get_team_memberships(self, use_alternative_method: bool = False, use_projects_method: bool = False) -> Dict[str, Set[str]]:
         """
         Get team memberships mapping.
         Returns: Dict mapping team names to sets of usernames.
         
         Args:
             use_alternative_method: If True, gets all users first then queries their teams
+            use_projects_method: If True, derives team membership from project ownership
         """
         memberships = defaultdict(set)
         
-        if use_alternative_method:
+        if use_projects_method:
+            # Projects method: Get all projects and infer team membership from owners
+            logger.info("Using projects method: deriving team membership from project owners")
+            projects = self.get_projects()
+            
+            # Build team ID to name mapping
+            teams = self.get_teams()
+            team_id_to_name = {team['id']: team['fullName'] for team in teams}
+            
+            for project in projects:
+                team_id = project.get('teamId')
+                owner_name = project.get('ownerName')
+                
+                if team_id in team_id_to_name and owner_name:
+                    team_name = team_id_to_name[team_id]
+                    memberships[team_name].add(owner_name)
+            
+            logger.warning("Note: Projects method only shows users who own projects. Some team members may be missing.")
+            for team_name, users in memberships.items():
+                logger.info(f"Team '{team_name}': {len(users)} project owners")
+                
+        elif use_alternative_method:
             # Alternative method: Get all users, then query each user's teams
             logger.info("Using alternative method: querying users then their teams")
             users = self.get_all_users()
@@ -202,7 +251,7 @@ class CheckmarxClient:
             
             if skipped_teams:
                 logger.warning(f"\nSkipped {len(skipped_teams)} team(s) due to permissions or no users")
-                logger.info("Try running with --alternative-method flag")
+                logger.info("Try running with --alternative-method or --projects-method flag")
         
         return dict(memberships)
 
@@ -296,7 +345,8 @@ def sync_team_memberships(cx_client: CheckmarxClient,
                          es_client: ElasticsearchClient,
                          team_filter: List[str] = None,
                          create_roles: bool = False,
-                         use_alternative_method: bool = False):
+                         use_alternative_method: bool = False,
+                         use_projects_method: bool = False):
     """
     Sync Checkmarx team memberships to Elasticsearch role mappings.
     
@@ -306,11 +356,12 @@ def sync_team_memberships(cx_client: CheckmarxClient,
         team_filter: Optional list of team names to sync (sync all if None)
         create_roles: If True, create ES roles that don't exist
         use_alternative_method: If True, use alternative API method to get memberships
+        use_projects_method: If True, derive memberships from project ownership
     """
     logger.info("Starting team membership sync")
     
     # Get team memberships from Checkmarx
-    memberships = cx_client.get_team_memberships(use_alternative_method)
+    memberships = cx_client.get_team_memberships(use_alternative_method, use_projects_method)
     
     # Filter teams if specified
     if team_filter:
@@ -364,6 +415,8 @@ def main():
                        help='Skip teams with no accessible users')
     parser.add_argument('--alternative-method', action='store_true',
                        help='Use alternative API method (get all users first, then their teams)')
+    parser.add_argument('--projects-method', action='store_true',
+                       help='Derive team membership from project ownership (may be incomplete)')
     
     args = parser.parse_args()
     
@@ -377,7 +430,7 @@ def main():
         # Perform sync
         if args.dry_run:
             logger.info("DRY RUN MODE - No changes will be made")
-            memberships = cx_client.get_team_memberships(args.alternative_method)
+            memberships = cx_client.get_team_memberships(args.alternative_method, args.projects_method)
             if args.teams:
                 memberships = {k: v for k, v in memberships.items() if k in args.teams}
             
@@ -385,7 +438,8 @@ def main():
                 print(f"\nTeam: {team}")
                 print(f"Users ({len(users)}): {', '.join(sorted(users))}")
         else:
-            sync_team_memberships(cx_client, es_client, args.teams, args.create_roles, args.alternative_method)
+            sync_team_memberships(cx_client, es_client, args.teams, args.create_roles, 
+                                args.alternative_method, args.projects_method)
         
     except Exception as e:
         logger.error(f"Script failed: {e}")
