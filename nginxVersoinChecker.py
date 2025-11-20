@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+"""
+Check nginx download page for newest version and alert each time a new version is available
+"""
 import requests
 import os
 from bs4 import BeautifulSoup
