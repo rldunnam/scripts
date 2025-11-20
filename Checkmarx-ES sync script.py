@@ -18,7 +18,6 @@ python sync_script.py --create-roles
 # Override a config value if needed
 python sync_script.py --cx-password different_password --teams DIT
 """
-
 import requests
 import json
 from typing import Dict, List, Set
@@ -99,7 +98,7 @@ class CheckmarxClient:
             logger.error(f"Failed to get teams: {e}")
             raise
     
-    def get_users_by_team(self, team_id: int) -> List[Dict]:
+    def get_users_by_team(self, team_id: int, team_name: str = "") -> List[Dict]:
         """Get all users for a specific team."""
         url = f"{self.base_url}/cxrestapi/auth/teams/{team_id}/users"
         
@@ -108,8 +107,14 @@ class CheckmarxClient:
             response.raise_for_status()
             users = response.json()
             return users
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                logger.warning(f"Access denied to team {team_id} ({team_name}). Skipping - user may not have permission.")
+            else:
+                logger.error(f"Failed to get users for team {team_id} ({team_name}): {e}")
+            return []
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get users for team {team_id}: {e}")
+            logger.error(f"Failed to get users for team {team_id} ({team_name}): {e}")
             return []
     
     def get_team_memberships(self) -> Dict[str, Set[str]]:
@@ -118,6 +123,7 @@ class CheckmarxClient:
         Returns: Dict mapping team names to sets of usernames.
         """
         memberships = defaultdict(set)
+        skipped_teams = []
         
         teams = self.get_teams()
         
@@ -125,14 +131,21 @@ class CheckmarxClient:
             team_name = team['fullName']
             team_id = team['id']
             
-            users = self.get_users_by_team(team_id)
+            users = self.get_users_by_team(team_id, team_name)
             
-            for user in users:
-                username = user.get('userName', user.get('username', ''))
-                if username:
-                    memberships[team_name].add(username)
-            
-            logger.info(f"Team '{team_name}': {len(users)} users")
+            if users:
+                for user in users:
+                    username = user.get('userName', user.get('username', ''))
+                    if username:
+                        memberships[team_name].add(username)
+                
+                logger.info(f"Team '{team_name}': {len(users)} users")
+            else:
+                # Check if this was due to permission issue vs empty team
+                skipped_teams.append(team_name)
+        
+        if skipped_teams:
+            logger.warning(f"\nSkipped {len(skipped_teams)} team(s) due to permissions or no users")
         
         return dict(memberships)
 
@@ -288,6 +301,8 @@ def main():
                        help='Create ES roles if they don\'t exist')
     parser.add_argument('--dry-run', action='store_true', 
                        help='Show what would be synced without making changes')
+    parser.add_argument('--skip-empty', action='store_true',
+                       help='Skip teams with no accessible users')
     
     args = parser.parse_args()
     
