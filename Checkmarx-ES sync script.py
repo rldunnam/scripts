@@ -7,7 +7,7 @@ Sample Usage
 python sync_script.py
 
 # Sync specific teams only
-python sync_script.py --teams DIT Engineering QA
+python sync_script.py --teams IT Engineering QA
 
 # Dry run to preview changes
 python sync_script.py --dry-run
