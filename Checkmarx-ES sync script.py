@@ -18,6 +18,7 @@ python sync_script.py --create-roles
 # Override a config value if needed
 python sync_script.py --cx-password different_password --teams DIT
 """
+
 import requests
 import json
 from typing import Dict, List, Set
