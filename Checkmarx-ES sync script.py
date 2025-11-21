@@ -17,10 +17,6 @@ python sync_script.py --create-roles
 
 # Override a config value if needed
 python sync_script.py --cx-password different_password --teams IT
-
-The role creation uses the final segment of the cx team path to name the rol.
-/CxServer/SP/Engineering/Backend → Elasticsearch role Backend
-/CxServer/SP/Company/MyApp → Elasticsearch role MyApp
 """
 
 import requests
@@ -29,6 +25,7 @@ from typing import Dict, List, Set
 from collections import defaultdict
 import argparse
 import logging
+from datetime import datetime
 
 # ============================================================================
 # CONFIGURATION - Update these values for your environment
@@ -44,6 +41,39 @@ ELASTICSEARCH_URL = "https://elasticsearch.example.com:9200"
 ELASTICSEARCH_USERNAME = "elastic"
 ELASTICSEARCH_PASSWORD = "your_password_here"
 
+# SSL Certificate Configuration
+# Set to False to disable SSL verification (not recommended for production)
+ELASTICSEARCH_VERIFY_SSL = True
+# Or specify path to CA certificate file
+ELASTICSEARCH_CA_CERT = None  # Example: "/path/to/ca-cert.pem"
+
+# Role Creation Configuration
+# These settings control what permissions are granted to auto-created roles
+ROLE_CONFIG = {
+    "cluster": [],  # Cluster-level permissions
+    "indices": [
+        {
+            "names": ["issues*", "scans*", "assets*"],
+            "privileges": ["read", "read_cross_cluster"],
+            "query": {
+                "term": {
+                    "saltminer.asset.attribute.team": "$TEAM"
+                }
+            }
+        }
+    ],
+    "applications": [
+        {
+            "application": "kibana-.kibana",
+            "privileges": ["read"],
+            "resources": ["*"]  # All Kibana spaces
+        }
+    ]
+}
+
+# Error log file
+ERROR_LOG_FILE = "sync_errors.log"
+
 # ============================================================================
 
 # Configure logging
@@ -52,6 +82,13 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def log_error_to_file(message: str):
+    """Log error messages to a separate error log file."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(ERROR_LOG_FILE, 'a') as f:
+        f.write(f"[{timestamp}] {message}\n")
 
 
 class CheckmarxClient:
@@ -121,16 +158,64 @@ class CheckmarxClient:
         """
         Get team memberships mapping.
         Returns: Dict mapping team names (last segment only) to sets of usernames.
+        Logs conflicts to error file and skips conflicting teams.
         """
         memberships = defaultdict(set)
+        team_name_mapping = defaultdict(list)  # Track which full names map to each short name
         teams = self.get_teams()
         
+        # First pass: collect all mappings and detect conflicts
         for team in teams:
             full_team_name = team['fullName']
             team_id = team['id']
             
             # Extract last part of hierarchical name (e.g., /CxServer/DIT -> DIT)
-            team_name = full_team_name.split('/')[-1]
+            short_name = full_team_name.split('/')[-1]
+            team_name_mapping[short_name].append((full_team_name, team_id))
+        
+        # Check for conflicts
+        conflicts = {name: paths for name, paths in team_name_mapping.items() if len(paths) > 1}
+        conflicting_full_names = set()
+        
+        if conflicts:
+            logger.warning("=" * 80)
+            logger.warning("CONFLICT DETECTED: Multiple Checkmarx teams map to the same role name")
+            logger.warning("Conflicting teams will be skipped and logged to error file")
+            logger.warning("=" * 80)
+            
+            log_error_to_file("=" * 80)
+            log_error_to_file("TEAM NAME CONFLICTS DETECTED")
+            log_error_to_file("=" * 80)
+            
+            for role_name, full_paths in conflicts.items():
+                conflict_msg = f"\nRole name '{role_name}' conflicts with:"
+                logger.warning(conflict_msg)
+                log_error_to_file(conflict_msg)
+                
+                for full_path, _ in full_paths:
+                    logger.warning(f"  - {full_path}")
+                    log_error_to_file(f"  - {full_path}")
+                    conflicting_full_names.add(full_path)
+            
+            log_error_to_file("\nThese teams were SKIPPED. To resolve:")
+            log_error_to_file("1. Rename teams in Checkmarx to have unique last segments")
+            log_error_to_file("2. Use --teams flag to manually specify which team to sync")
+            log_error_to_file("=" * 80 + "\n")
+            
+            logger.warning(f"\nSkipping {len(conflicting_full_names)} conflicting teams")
+            logger.warning(f"Details logged to: {ERROR_LOG_FILE}")
+            logger.warning("=" * 80 + "\n")
+        
+        # Second pass: collect user memberships (skip conflicting teams)
+        for team in teams:
+            full_team_name = team['fullName']
+            team_id = team['id']
+            short_name = full_team_name.split('/')[-1]
+            
+            # Skip conflicting teams
+            if full_team_name in conflicting_full_names:
+                logger.info(f"SKIPPED (conflict): '{full_team_name}'")
+                continue
             
             users = self.get_users_by_team(team_id, full_team_name)
             
@@ -138,9 +223,9 @@ class CheckmarxClient:
                 for user in users:
                     username = user.get('userName', user.get('username', ''))
                     if username:
-                        memberships[team_name].add(username)
+                        memberships[short_name].add(username)
                 
-                logger.info(f"Team '{full_team_name}' -> Role '{team_name}': {len(users)} users")
+                logger.info(f"Team '{full_team_name}' -> Role '{short_name}': {len(users)} users")
             else:
                 logger.warning(f"Team '{full_team_name}': No users found")
         
@@ -150,11 +235,23 @@ class CheckmarxClient:
 class ElasticsearchClient:
     """Client for interacting with Elasticsearch Security API."""
     
-    def __init__(self, base_url: str, username: str, password: str):
+    def __init__(self, base_url: str, username: str, password: str, verify_ssl=True, ca_cert=None, role_config=None):
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
         self.session.auth = (username, password)
         self.session.headers.update({'Content-Type': 'application/json'})
+        self.role_config = role_config or ROLE_CONFIG
+        
+        # Configure SSL verification
+        if ca_cert:
+            self.session.verify = ca_cert
+        else:
+            self.session.verify = verify_ssl
+        
+        # Suppress InsecureRequestWarning if SSL verification is disabled
+        if not verify_ssl:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     def get_role_mapping(self, role_name: str) -> Dict:
         """Get current role mapping for a role."""
@@ -199,7 +296,7 @@ class ElasticsearchClient:
             return False
     
     def create_role_if_not_exists(self, role_name: str) -> bool:
-        """Create a basic role if it doesn't exist."""
+        """Create a role if it doesn't exist, using the configured role template."""
         url = f"{self.base_url}/_security/role/{role_name}"
         
         # Check if role exists
@@ -211,25 +308,55 @@ class ElasticsearchClient:
         except:
             pass
         
-        # Create basic role with minimal permissions
+        # Build role definition from config template
         role_def = {
-            "cluster": ["monitor"],
-            "indices": [
-                {
-                    "names": [f"{role_name.lower()}-*"],
-                    "privileges": ["read", "view_index_metadata"]
-                }
-            ]
+            "cluster": self.role_config.get("cluster", []),
+            "indices": [],
+            "applications": []
         }
         
+        # Process index permissions, replacing placeholders with actual role name
+        for idx_config in self.role_config.get("indices", []):
+            idx_def = {
+                "names": idx_config["names"],
+                "privileges": idx_config["privileges"]
+            }
+            
+            # Add document-level security query if present
+            if "query" in idx_config:
+                # Replace $TEAM placeholder in the query structure
+                query_with_team = self._replace_team_placeholder(idx_config["query"], role_name)
+                idx_def["query"] = query_with_team
+            
+            role_def["indices"].append(idx_def)
+        
+        # Add application privileges (e.g., Kibana)
+        for app_config in self.role_config.get("applications", []):
+            role_def["applications"].append(app_config)
+        
+        # Create the role
         try:
             response = self.session.put(url, json=role_def)
             response.raise_for_status()
-            logger.info(f"Created role '{role_name}'")
+            logger.info(f"Created role '{role_name}' with document-level security")
+            logger.debug(f"Role definition: {json.dumps(role_def, indent=2)}")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to create role {role_name}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response: {e.response.text}")
             return False
+    
+    def _replace_team_placeholder(self, obj, team_name: str):
+        """Recursively replace $TEAM placeholder in query structure."""
+        if isinstance(obj, dict):
+            return {k: self._replace_team_placeholder(v, team_name) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._replace_team_placeholder(item, team_name) for item in obj]
+        elif isinstance(obj, str) and "$TEAM" in obj:
+            return obj.replace("$TEAM", team_name)
+        else:
+            return obj
 
 
 def sync_team_memberships(cx_client: CheckmarxClient, 
@@ -291,6 +418,11 @@ def main():
     parser.add_argument('--es-url', default=ELASTICSEARCH_URL, help='Elasticsearch base URL')
     parser.add_argument('--es-user', default=ELASTICSEARCH_USERNAME, help='Elasticsearch username')
     parser.add_argument('--es-password', default=ELASTICSEARCH_PASSWORD, help='Elasticsearch password')
+    parser.add_argument('--es-verify-ssl', type=lambda x: x.lower() == 'true', 
+                       default=ELASTICSEARCH_VERIFY_SSL, 
+                       help='Verify SSL certificate (true/false)')
+    parser.add_argument('--es-ca-cert', default=ELASTICSEARCH_CA_CERT, 
+                       help='Path to CA certificate file')
     
     # Optional arguments
     parser.add_argument('--teams', nargs='+', help='Specific teams to sync (default: all)')
@@ -306,7 +438,8 @@ def main():
         cx_client = CheckmarxClient(args.cx_url, args.cx_user, args.cx_password)
         cx_client.authenticate()
         
-        es_client = ElasticsearchClient(args.es_url, args.es_user, args.es_password)
+        es_client = ElasticsearchClient(args.es_url, args.es_user, args.es_password, 
+                                       args.es_verify_ssl, args.es_ca_cert)
         
         # Perform sync
         if args.dry_run:
