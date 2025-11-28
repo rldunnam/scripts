@@ -158,15 +158,15 @@ class Config:
             elif not self.slack_webhook_url.startswith('https://hooks.slack.com/'):
                 errors.append("SLACK_WEBHOOK_URL appears to be invalid")
         
-        if not self.enable_email and not self.enable_slack:
-            errors.append("At least one notification method must be enabled. Use --enable-email or --enable-slack")
-        
         if errors:
             raise ConfigError("Configuration validation failed:\n  - " + "\n  - ".join(errors))
         
         logger.info("Configuration validated successfully")
         logger.info(f"Email notifications: {'enabled' if self.enable_email else 'disabled'}")
         logger.info(f"Slack notifications: {'enabled' if self.enable_slack else 'disabled'}")
+        
+        if not self.enable_email and not self.enable_slack:
+            logger.info("Running in console-only mode (no notifications will be sent)")
 
 
 def sanitize_version(version: str) -> str:
@@ -344,9 +344,14 @@ def notify_new_version(config: Config, version: str) -> bool:
     Send all configured notifications
     
     Returns:
-        True if at least one notification succeeded
+        True if notifications sent or none configured, False if all notifications failed
     """
     logger.info(f"New version detected: {version}")
+    
+    # If no notifications are configured, just log and return success
+    if not config.enable_email and not config.enable_slack:
+        logger.info("No notifications configured - version detection logged to console only")
+        return True
     
     success = False
     
