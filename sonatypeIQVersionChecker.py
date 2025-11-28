@@ -11,11 +11,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # Slack webhook URL (replace with your actual webhook URL)
-SLACK_WEBHOOK_URL = 'https://hooks.slack.com/services/T5B327YJ0/<YOUR SLACK TOKEN>'
+SLACK_WEBHOOK_URL = '<enter your URL and token here>'
 #test webhook call: curl -X POST -H "Content-type: application/json" -d "{\"text\":\"test\"}" (SLACK_WEBHOOK_URL)
 
 # Email settings (configure these)
-#SMTP_SERVER = 'smtp.office365.com'
+SMTP_SERVER = 'smtp.office365.com'
 SMTP_PORT = 587
 EMAIL_USERNAME = 'email'
 EMAIL_PASSWORD = 'your_password'
@@ -27,16 +27,6 @@ URL = 'https://help.sonatype.com/en/iq-server-release-notes.html'
 
 VERSION_PATTERN = r"\b\d{3}\b"
 VERSION_FILE = 'sonatype_last_version.txt'
-
-def get_mocked_html():
-    return """
-    <html>
-        <body>
-            <h2>IQ Server CLI Version 191</h2>
-            <p>Previous versions: 190, 189</p>
-        </body>
-    </html>
-    """
 
 def get_latest_version():
     try:
@@ -119,12 +109,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-# Test cases
-assert re.findall(r"\d+\.\d+(?:\.\d+)?", "Version 1.2.3") == ["1.2.3"]
-assert re.findall(r"\d+\.\d+(?:\.\d+)?", "release 1.190.0-01") == ["1.190.0"]
-assert re.findall(r"\d+\.\d+(?:\.\d+)?", "Latest version is 1.191") == ["1.191"]
-assert sorted(["1.2.10", "1.2.2", "1.3.0"], key=lambda s: list(map(int, s.split('.'))), reverse=True)[0] == "1.3.0"
-assert sorted(["1.191.0", "1.190.0", "1.189.0"], key=lambda s: list(map(int, s.split('.'))), reverse=True)[0] == "1.191.0"
-print("All tests passed.")
 
